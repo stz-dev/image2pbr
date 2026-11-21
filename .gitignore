@@ -1,0 +1,23 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+
+# generated
+output/
+selftest_out/
+.cache/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
