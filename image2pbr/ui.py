@@ -14,7 +14,7 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
-from . import ai, export, pbr, preview, settings
+from . import ai, export, pbr, presets, settings, viewer
 
 OUT_DIR = str(settings.ROOT / "output")
 PREVIEW_SIDE = 1024
@@ -244,13 +244,33 @@ def do_reset(map_name, pal, k):
 def do_preset(img, k, map_name, preset):
     if not preset:
         return [gr.update()] * len(FLAT)
-    return _widget_updates({map_name: pbr.preset_params(preset, map_name, int(k))})
+    return _widget_updates({map_name: presets.get_params(preset, map_name, int(k))})
 
 
 def do_preset_all(k, preset):
     if not preset:
         return [gr.update()] * len(FLAT)
-    return _widget_updates({m: pbr.preset_params(preset, m, int(k)) for m in pbr.MAPS})
+    return _widget_updates({m: presets.get_params(preset, m, int(k)) for m in pbr.MAPS})
+
+
+def do_save_preset(name, include_lists, *vals):
+    """Save the current slider values of ALL maps as a named user preset."""
+    try:
+        label = presets.save_user(name, {m: _params_from_widgets(m, vals) for m in pbr.MAPS}, include_lists)
+    except ValueError as e:
+        raise gr.Error(str(e))
+    gr.Info(f"Preset saved: {label}")
+    choices = presets.names()
+    return gr.update(choices=choices, value=label), gr.update(choices=choices), ""
+
+
+def do_delete_preset(label):
+    if not presets.is_user(label):
+        raise gr.Error("Select one of YOUR presets (they start with 'My: '). Built-in presets cannot be deleted.")
+    presets.delete_user(label)
+    gr.Info(f"Preset deleted: {label}")
+    choices = presets.names()
+    return gr.update(choices=choices, value=None), gr.update(choices=choices, value=None)
 
 
 def do_switch(map_name):
@@ -287,17 +307,17 @@ def do_all(img, pal, k, seamless, blend, hint, send_img, desc, sel_maps, size, m
     if not desc.strip():
         desc = ai.describe_with_qwen(rgb, pal, hint)
 
+    wanted = [x for x in pbr.MAPS if x in sel_maps]
+    results = ai.params_for_maps(wanted, desc, pal, hint, rgb if send_img else None)   # ONE Gemini request
     params_by_map, notes, warnings = {}, [], []
     maps = dict(maps or {})
-    for m in [x for x in pbr.MAPS if x in sel_maps]:
-        try:
-            params, note = ai.params_with_gemini(m, desc, pal, hint, rgb if send_img else None)
+    for m in wanted:
+        if m in results:
+            params, note = results[m]
             notes.append(f"**{m}:** {note}")
-        except ai.AIError as e:
-            if e.kind in ("key", "network"):
-                raise
+        else:
             params = pbr.sanitize(m, {}, len(pal["share"]))
-            warnings.append(f"{m}: AI failed ({e}) - default parameters used")
+            warnings.append(f"{m}: not in the AI answer - default parameters used")
         params_by_map[m] = params
         maps[m] = pbr.render(rgb, m, params, pal, max_side=PREVIEW_SIDE)
         hist = _push(hist, m, params)
@@ -339,24 +359,23 @@ def do_zip_current(img, pal, k, seamless, blend, sel_maps, size, *vals):
 # --------------------------------------------------------------------------
 # 3D preview
 # --------------------------------------------------------------------------
-PREVIEW_LAYERS = {"Base colour": "basecolor", "Roughness": "roughness", "Metallic": "metallic",
-                  "Normal": "normal", "Height (bump)": "height", "AO": "ao"}
-
-
-def do_preview(img, seamless, blend, maps, use, shape, tile, az, el, hstrength):
-    """Shade the sphere/plane with the generated maps selected in `use`."""
+def do_preview(img, seamless, blend, maps):
+    """Build the interactive WebGL viewer (HTML) from the image and the generated maps."""
     if img is None:
-        return None, "Upload an image first."
+        return "", "Upload an image first.", None
     maps = maps or {}
-    use_keys = [PREVIEW_LAYERS[x] for x in (use or []) if x in PREVIEW_LAYERS]
-    albedo = pbr.fit(_prep(img, seamless, blend), 512)
-    arr = preview.render_preview(albedo, maps, shape, tile, az, el, use=use_keys, height_strength=hstrength)
-    applied = [k for k in use_keys if k == "basecolor" or k in maps]
-    missing = [k for k in use_keys if k != "basecolor" and k not in maps]
-    info = "**Applied:** " + (", ".join(applied) if applied else "nothing")
+    albedo = pbr.fit(_prep(img, seamless, blend), 1024)
+    doc = viewer.build_document(albedo, maps, 512)
+    have = [m for m in pbr.MAPS if m in maps]
+    info = "**Maps in the viewer:** base colour" + "".join(f", {m}" for m in have)
+    missing = [m for m in pbr.MAPS if m not in maps]
     if missing:
-        info += f"  \n**Not generated yet (ignored):** {', '.join(missing)}. Generate them on the first tab."
-    return arr, info
+        info += f"  \n**Not generated yet:** {', '.join(missing)} (their sliders are disabled)."
+    path = os.path.join(OUT_DIR, "viewer.html")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(doc)
+    return viewer.iframe(doc, 720), info, path
 
 
 # --------------------------------------------------------------------------
@@ -386,22 +405,21 @@ def do_batch(files, sel_maps, mode, preset, k, seamless, blend, size, hint, send
                 pal = pbr.extract_palette(rgb, int(k))
                 kk = len(pal["share"])
                 if mode == "Preset (no AI)":
-                    params = {m: pbr.preset_params(preset, m, kk) for m in maps_sel}
+                    params = {m: presets.get_params(preset, m, kk) for m in maps_sel}
                 elif mode == "Current slider settings":
                     params = _all_params(vals, maps_sel, strip_lists=True)
                 else:
                     if fatal:
                         raise ai.AIError("AI skipped (key/network problem earlier)", None, "other")
                     desc = ai.describe_with_qwen(rgb, pal, hint)
+                    res = ai.params_for_maps(maps_sel, desc, pal, hint, rgb if send_img else None)
                     params = {}
                     for m in maps_sel:
-                        try:
-                            params[m], _ = ai.params_with_gemini(m, desc, pal, hint, rgb if send_img else None)
-                        except ai.AIError as e:
-                            if e.kind in ("key", "network"):
-                                raise
+                        if m in res:
+                            params[m] = res[m][0]
+                        else:
                             params[m] = pbr.sanitize(m, {}, kk)
-                            log.append(f"    {m}: AI failed ({e.kind}), defaults used")
+                            log.append(f"    {m}: not in the AI answer, defaults used")
                 export.write_bundle(zf, f"{name}/", rgb, pal, params, _size(size))
                 log[-1] += " done"
             except ai.AIError as e:
@@ -536,8 +554,21 @@ def build() -> gr.Blocks:
                             btn_desc = gr.Button("1. Describe (Qwen)")
                             btn_gem = gr.Button("2. Settings (Gemini)")
                         with gr.Row():
-                            preset = gr.Dropdown(list(pbr.PRESETS), value=None, label="Preset (no AI)")
+                            preset = gr.Dropdown(presets.names(), value=None, label="Preset (no AI)")
                             btn_preset_all = gr.Button("Apply preset to ALL maps")
+                        with gr.Accordion("Save / delete my presets", open=False):
+                            gr.Markdown("Saves the current slider values of **all** maps under a name. "
+                                        "Your presets appear in the dropdown above as *My: name* "
+                                        "(stored in `user_presets.json` next to the app).")
+                            with gr.Row():
+                                preset_name = gr.Textbox(label="Preset name", placeholder="e.g. Brushed steel",
+                                                         scale=2)
+                                preset_lists = gr.Checkbox(value=False, scale=1,
+                                                           label="Include per-colour values (only useful for "
+                                                                 "images with the same colours)")
+                            with gr.Row():
+                                btn_psave = gr.Button("💾 Save preset")
+                                btn_pdel = gr.Button("🗑 Delete selected preset")
                         err_box = gr.Markdown("")
                         palette_html = gr.HTML()
                         desc = gr.Textbox(label="Texture description (editable)", lines=8)
@@ -570,33 +601,27 @@ def build() -> gr.Blocks:
 
             # ------------------------------------------------------------------ 3D preview
             with gr.Tab("3D preview") as tab_prev:
-                gr.Markdown("A quick lit preview of your generated maps (software shading, not Blender). "
-                            "It updates after **Generate ALL**, when you open this tab, and when you change any "
-                            "option here. Tick the layers you want to see applied.")
+                gr.Markdown("**Real-time 3D viewer** (WebGL, runs in your browser). Drag to rotate, wheel to zoom. "
+                            "Every map has its own **strength slider** inside the viewer (0 = off); height can act "
+                            "as bump and as real displacement. It refreshes after **Generate ALL**, when you open "
+                            "this tab, or with the button.")
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        use_layers = gr.CheckboxGroup(list(PREVIEW_LAYERS), value=list(PREVIEW_LAYERS),
-                                                      label="Maps applied in the preview")
-                        shape = gr.Radio(["Sphere", "Plane"], value="Sphere", label="Shape")
-                        tile = gr.Slider(1, 8, value=2, step=0.5, label="Tiling")
-                        az = gr.Slider(-90, 90, value=40, step=1, label="Light direction (left <-> right)")
-                        el = gr.Slider(5, 85, value=45, step=1, label="Light height")
-                        hstr = gr.Slider(0, 6, value=1, step=0.1, label="Height bump strength")
-                        btn_prev = gr.Button("Update preview", variant="primary")
-                        prev_info = gr.Markdown("")
-                    prev_img = gr.Image(label="Preview", interactive=False, height=520)
+                    btn_prev = gr.Button("Refresh viewer", variant="primary", scale=1)
+                    prev_file = gr.File(label="Standalone viewer (open in any browser)", interactive=False, scale=2)
+                prev_info = gr.Markdown("")
+                prev_html = gr.HTML()
 
             # ------------------------------------------------------------------ Batch
             with gr.Tab("Batch"):
                 gr.Markdown("Process many images at once. Result: one ZIP with a folder per image "
-                            "(maps + Blender script). AI mode uses 1 Qwen + 1 Gemini call per map per image, "
+                            "(maps + Blender script). AI mode uses 1 Qwen + 1 Gemini request per image, "
                             "so mind the free-tier limits (the cache helps when you re-run).")
                 b_files = gr.File(label="Images", file_count="multiple", file_types=["image"])
                 with gr.Row():
                     b_maps = gr.CheckboxGroup(pbr.MAPS, value=DEFAULT_MAPS, label="Maps")
                     b_mode = gr.Radio(["AI for every image", "Preset (no AI)", "Current slider settings"],
                                       value="AI for every image", label="Settings source")
-                    b_preset = gr.Dropdown(list(pbr.PRESETS), value=None, label="Preset (for preset mode)")
+                    b_preset = gr.Dropdown(presets.names(), value=None, label="Preset (for preset mode)")
                 b_run = gr.Button("Run batch", variant="primary")
                 b_log = gr.Textbox(label="Log", lines=10, interactive=False)
                 b_zip = gr.File(label="Batch ZIP")
@@ -638,7 +663,8 @@ def build() -> gr.Blocks:
         map_choice.change(do_switch, map_choice, [groups[m] for m in pbr.MAPS]).then(
             do_render, render_in, render_out)
 
-        prev_in = [img, seamless, blend, maps_state, use_layers, shape, tile, az, el, hstr]
+        prev_in = [img, seamless, blend, maps_state]
+        prev_out = [prev_html, prev_info, prev_file]
         ai_in = [img, pal_state, k_slider, seamless, blend]
         # single-step buttons
         e = btn_desc.click(do_describe, ai_in + [hint], [desc, err_box])
@@ -659,10 +685,12 @@ def build() -> gr.Blocks:
         e = btn_all.click(do_all, ai_in + [hint, send_img, desc, sel_maps, size_dd, map_choice, maps_state, hist_state],
                           [desc, notes, err_box, result, maps_state, hist_state, zip_file] + comps)
         e.failure(show_error, None, err_box)
-        e.success(do_preview, prev_in, [prev_img, prev_info])
+        e.success(do_preview, prev_in, prev_out)
 
         preset.input(do_preset, [img, k_slider, map_choice, preset], comps).then(do_render, render_in, render_out)
         btn_preset_all.click(do_preset_all, [k_slider, preset], comps).then(do_render, render_in, render_out)
+        btn_psave.click(do_save_preset, [preset_name, preset_lists] + comps, [preset, b_preset, preset_name])
+        btn_pdel.click(do_delete_preset, preset, [preset, b_preset])
 
         btn_render.click(do_render, render_in, render_out)
         btn_undo.click(do_undo, [map_choice, hist_state], [hist_state] + comps).then(
@@ -683,10 +711,8 @@ def build() -> gr.Blocks:
                 triggers.append(c.submit)
         gr.on(triggers=triggers, fn=do_render, inputs=render_in, outputs=render_out)
 
-        btn_prev.click(do_preview, prev_in, [prev_img, prev_info])
-        tab_prev.select(do_preview, prev_in, [prev_img, prev_info])
-        gr.on([use_layers.input, shape.input, tile.release, az.release, el.release, hstr.release],
-              do_preview, prev_in, [prev_img, prev_info])
+        btn_prev.click(do_preview, prev_in, prev_out)
+        tab_prev.select(do_preview, prev_in, prev_out)
 
         b_run.click(do_batch, [b_files, b_maps, b_mode, b_preset, k_slider, seamless, blend, size_dd, hint, send_img]
                     + comps, [b_log, b_zip])

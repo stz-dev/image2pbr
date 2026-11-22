@@ -54,16 +54,18 @@ def main():
         except ai.AIError as e:
             print("  Qwen failed:", e)
 
-    tiles, params_by_map = [rgb], {}
+    results = {}
+    if ok:
+        print("\n== Gemini (one request for all maps)...")
+        try:
+            results = ai.params_for_maps(pbr.MAPS, desc, pal)
+        except ai.AIError as e:
+            print("  Gemini failed:", e)
+
+    tiles = [rgb]
     for m in pbr.MAPS:
-        params = pbr.defaults(m)
-        if ok:
-            try:
-                params, notes = ai.params_with_gemini(m, desc, pal)
-                print(f"\n== Gemini -> {m}: {notes}")
-            except ai.AIError as e:
-                print(f"\n== Gemini -> {m} failed: {e}")
-        params_by_map[m] = params
+        params, notes = results.get(m, (pbr.defaults(m), "(defaults)"))
+        print(f"  {m}: {notes}")
         out = pbr.render(rgb, m, params, pal, max_side=2048)
         export.save_png(f"{OUT}/{m}.png", out)
         out8 = (out >> 8).astype(np.uint8) if out.dtype == np.uint16 else out

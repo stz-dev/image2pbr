@@ -1,3 +1,4 @@
+import os
 import zipfile
 
 import pytest
@@ -27,8 +28,9 @@ def test_error_explanations():
 
 def test_generate_all_flow_with_fake_ai(monkeypatch):
     monkeypatch.setattr(ai, "describe_with_qwen", lambda rgb, pal, hint="", model=None: "wood")
-    monkeypatch.setattr(ai, "params_with_gemini",
-                        lambda m, d, pal, hint="", rgb=None, model=None: (pbr.sanitize(m, {}, len(pal["share"])), "n"))
+    monkeypatch.setattr(ai, "params_for_maps",
+                        lambda ms, d, pal, hint="", rgb=None, model=None:
+                        {m: (pbr.sanitize(m, {}, len(pal["share"])), "n") for m in ms})
     img = samples.make_wood(256)
     pal, *_ = ui.on_upload(img, 4)
     out = ui.do_all(img, pal, 4, False, 0.5, "", False, "", ["roughness", "normal", "ao"], "1024",
@@ -52,11 +54,28 @@ def test_undo_restores_previous_values():
     assert res[0]["roughness"][-1]["blur"] == 0.0
 
 
-def test_preview_handler_reports_missing_maps():
+def test_preview_handler_builds_viewer():
     img = samples.make_wood(128)
-    arr, info = ui.do_preview(img, False, 0.5, {"roughness": pbr.render(img, "roughness", pbr.defaults("roughness"), None)},
-                              ["Base colour", "Roughness", "Normal"], "Sphere", 2, 40, 45, 2.0)
-    assert arr.shape == (512, 512, 3)
-    assert "roughness" in info and "normal" in info and "Not generated" in info
-    arr, info = ui.do_preview(None, False, 0.5, {}, [], "Sphere", 2, 40, 45, 2.0)
-    assert arr is None
+    maps = {"roughness": pbr.render(img, "roughness", pbr.defaults("roughness"), None)}
+    html, info, path = ui.do_preview(img, False, 0.5, maps)
+    assert "<iframe" in html and "srcdoc" in html
+    assert "normal" in info and "Not generated" in info
+    assert os.path.isfile(path) and "WebGL" in open(path, encoding="utf-8").read()
+    html, info, path = ui.do_preview(None, False, 0.5, {})
+    assert html == "" and path is None
+
+
+def test_preset_save_and_delete_handlers(tmp_path, monkeypatch):
+    from image2pbr import presets
+    monkeypatch.setenv("IMAGE2PBR_PRESETS", str(tmp_path / "p.json"))
+    vals = [(sp["default"] if sp["kind"] != "list" else "") for _, sp in ui.FLAT]
+    upd, upd_b, cleared = ui.do_save_preset("My wood", False, *vals)
+    assert "My: My wood" in upd["choices"] and upd["value"] == "My: My wood" and cleared == ""
+    ups = ui.do_preset(None, 6, "roughness", "My: My wood")
+    assert len(ups) == len(ui.FLAT)
+    with pytest.raises(gr.Error):
+        ui.do_delete_preset("Wood")                          # built-in
+    ui.do_delete_preset("My: My wood")
+    assert presets.load_user() == {}
+    with pytest.raises(gr.Error):
+        ui.do_save_preset("", False, *vals)

@@ -66,7 +66,7 @@ def test_gemini_parses_sanitizes_and_caches(monkeypatch, img_pal):
 
     def fake(method, url, **kw):
         calls.append(url)
-        return gemini_ok({"strength": 99, "palette_heights": [0.5], "notes": "ok", "bogus": 1})
+        return gemini_ok({"normal": {"strength": 99, "palette_heights": [0.5], "notes": "ok", "bogus": 1}})
 
     monkeypatch.setattr(requests, "request", fake)
     params, notes = ai.params_with_gemini("normal", "wood", img_pal[1])
@@ -79,14 +79,14 @@ def test_gemini_parses_sanitizes_and_caches(monkeypatch, img_pal):
 def test_cache_can_be_disabled(monkeypatch, img_pal):
     monkeypatch.setenv("IMAGE2PBR_CACHE", "0")
     calls = []
-    monkeypatch.setattr(requests, "request", lambda *a, **k: calls.append(1) or gemini_ok({"notes": "x"}))
+    monkeypatch.setattr(requests, "request", lambda *a, **k: calls.append(1) or gemini_ok({"ao": {"notes": "x"}}))
     ai.params_with_gemini("ao", "wood", img_pal[1])
     ai.params_with_gemini("ao", "wood", img_pal[1])
     assert len(calls) == 2
 
 
 def test_gemini_list_response_and_code_fence(monkeypatch, img_pal):
-    text = "```json\n[{\"ao_strength\": 3}]\n```"
+    text = "```json\n[{\"ao\": {\"ao_strength\": 3}}]\n```"
     resp = FakeResp(200, {"candidates": [{"content": {"parts": [{"text": text}]}}]})
     monkeypatch.setattr(requests, "request", lambda *a, **k: resp)
     params, _ = ai.params_with_gemini("ao", "wood", img_pal[1])
@@ -142,3 +142,39 @@ def test_env_file_roundtrip(tmp_path):
     text = p.read_text()
     assert "FOO=bar" in text and "GEMINI_API_KEY=new" in text and "GROQ_API_KEY=q" in text
     assert "old" not in text
+
+
+def test_many_maps_use_one_request_and_partial_cache(monkeypatch, img_pal):
+    prompts = []
+
+    def fake(method, url, **kw):
+        prompts.append(kw["json"]["contents"][0]["parts"][0]["text"])
+        asked = [m for m in pbr.MAPS if f'=== MAP "{m}" ===' in prompts[-1]]
+        return gemini_ok({m: {"notes": f"n-{m}", "strength": 3} for m in asked})
+
+    monkeypatch.setattr(requests, "request", fake)
+    wanted = ["roughness", "metallic", "normal", "height", "ao"]
+    res = ai.params_for_maps(wanted, "wood", img_pal[1])
+    assert len(prompts) == 1 and set(res) == set(wanted)          # 5 maps, ONE request
+    assert res["normal"][0]["strength"] == 3 and res["ao"][1] == "n-ao"
+    ai.params_for_maps(wanted, "wood", img_pal[1])
+    assert len(prompts) == 1                                      # everything cached
+    ai.params_for_maps(["roughness"], "wood", img_pal[1])
+    assert len(prompts) == 1                                      # single map reuses the same cache
+    ai.params_for_maps(["roughness"], "metal", img_pal[1])        # different description -> new request
+    assert len(prompts) == 2
+
+
+def test_missing_map_in_answer_is_reported(monkeypatch, img_pal):
+    monkeypatch.setattr(requests, "request", lambda *a, **k: gemini_ok({"roughness": {"notes": "x"}}))
+    res = ai.params_for_maps(["roughness", "ao"], "wood", img_pal[1])
+    assert "roughness" in res and "ao" not in res
+    with pytest.raises(ai.AIError):
+        ai.params_with_gemini("ao", "wood2", img_pal[1])
+
+
+def test_answer_without_requested_maps_is_error(monkeypatch, img_pal):
+    monkeypatch.setattr(requests, "request", lambda *a, **k: gemini_ok({"other": {}}))
+    with pytest.raises(ai.AIError) as e:
+        ai.params_for_maps(["normal"], "wood", img_pal[1])
+    assert e.value.kind == "response"

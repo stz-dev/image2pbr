@@ -274,51 +274,96 @@ def _extract_json(text: str):
             raise AIError("Gemini returned broken JSON: " + text[:200], "gemini", "response")
 
 
-def params_with_gemini(map_name: str, description: str, pal: dict, hint: str = "",
-                       rgb=None, model: str | None = None) -> tuple[dict, str]:
+PROMPT_VERSION = "3"
+
+
+def params_for_maps(map_names, description: str, pal: dict, hint: str = "", rgb=None,
+                    model: str | None = None) -> dict:
+    """Ask Gemini for the settings of SEVERAL maps in ONE request.
+
+    Returns {map: (params, notes)}. Maps already in the cache are not requested again, so
+    re-running or asking for one more map costs nothing/less. Maps missing in the answer are
+    absent from the result (the caller falls back to defaults).
+    """
     key = _need_key("gemini")
     model = model or settings.gemini_model()
+    map_names = [m for m in pbr.MAPS if m in set(map_names)]
     k = len(pal["share"])
 
     colors = "\n".join(
         f'  #{c["index"]}: {c["hex"]}, hue={c["hue"]}, saturation={c["saturation"]}, '
         f'brightness={c["brightness"]}, area={c["share_percent"]}%' for c in pbr.palette_info(pal))
+    img_b64 = _jpeg_b64(rgb, 768) if rgb is not None else ""
+    base = (PROMPT_VERSION, model, description, colors, hint.strip(),
+            hashlib.sha256(img_b64.encode()).hexdigest())
+
+    results, todo = {}, []
+    for m in map_names:
+        c = cache_get("gemini_map", m, *base)
+        if c is not None:
+            results[m] = (pbr.sanitize(m, c["params"], k), c.get("notes", ""))
+        else:
+            todo.append(m)
+    if not todo:
+        return results
+
+    sections = "\n\n".join(
+        f'=== MAP "{m}" ===\n{GUIDE[m]}\nPARAMETERS of "{m}" (use only these keys, respect ranges):\n'
+        f'{pbr.schema_text(m, k)}' for m in todo)
     prompt = (
-        f"You configure a procedural generator that builds a Blender PBR '{map_name}' map from a texture "
-        "image. The map is computed per pixel from the image itself, so your job is only to choose "
-        "parameters that make the result physically correct for THIS material and consistent with the "
-        "picture (no random-looking patterns).\n\n"
+        "You configure a procedural generator that builds Blender PBR maps from a texture image. "
+        "Every map is computed per pixel from the image itself, so your job is only to choose parameters "
+        "that make each map physically correct for THIS material and consistent with the picture (no "
+        "random-looking patterns).\n\n"
         f"MATERIAL DESCRIPTION (from a vision model):\n{description}\n\n"
         f"PALETTE ({k} colours, index = position in the list-type parameters):\n{colors}\n\n"
         + (f"USER HINT: {hint.strip()}\n\n" if hint.strip() else "")
-        + f"{GUIDE[map_name]}\n\n"
-        f"AVAILABLE PARAMETERS (use only these keys, respect ranges):\n{pbr.schema_text(map_name, k)}\n\n"
-        'Return ONE JSON object with these keys and an extra string key "notes" (1-3 sentences in '
-        "English explaining the main choices). Return JSON only."
+        + "Maps to configure: " + ", ".join(todo) + ".\n"
+        "Keep them CONSISTENT: normal, height and ao describe the same relief, so use the same "
+        "channel / invert / delight / blur for them unless there is a clear reason not to.\n\n"
+        + sections + "\n\n"
+        "Return ONE JSON object whose top-level keys are exactly: " + ", ".join(f'"{m}"' for m in todo) + ". "
+        "Each value is an object with that map's parameter keys plus a string key \"notes\" "
+        "(1-2 sentences in English explaining the main choices). Return JSON only."
     )
 
-    img_b64 = _jpeg_b64(rgb, 768) if rgb is not None else ""
-    ck = (model, prompt, hashlib.sha256(img_b64.encode()).hexdigest())
-    raw = cache_get("gemini", *ck)
-    if raw is None:
-        parts = [{"text": prompt}]
-        if img_b64:
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
-        body = {"contents": [{"parts": parts}],
-                "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
-        r = _request("POST", GEMINI_URL.format(model=model), "gemini", json=body,
-                     headers={"x-goog-api-key": key})
-        _check(r, "gemini")
-        try:
-            rparts = r.json()["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in rparts if not p.get("thought"))
-        except (KeyError, IndexError, TypeError):
-            raise AIError("Gemini: empty answer (a safety filter may have fired).", "gemini", "response")
-        raw = _extract_json(text)
-        if isinstance(raw, list):
-            raw = next((x for x in raw if isinstance(x, dict)), {})
+    parts = [{"text": prompt}]
+    if img_b64:
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
+    body = {"contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
+    r = _request("POST", GEMINI_URL.format(model=model), "gemini", json=body, headers={"x-goog-api-key": key})
+    _check(r, "gemini")
+    try:
+        rparts = r.json()["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in rparts if not p.get("thought"))
+    except (KeyError, IndexError, TypeError):
+        raise AIError("Gemini: empty answer (a safety filter may have fired).", "gemini", "response")
+    data = _extract_json(text)
+    if isinstance(data, list):
+        data = next((x for x in data if isinstance(x, dict)), {})
+    if not isinstance(data, dict):
+        raise AIError("Gemini returned JSON of an unexpected shape.", "gemini", "response")
+
+    found = 0
+    for m in todo:
+        raw = data.get(m)
         if not isinstance(raw, dict):
-            raise AIError("Gemini returned JSON of an unexpected shape.", "gemini", "response")
-        cache_put("gemini", raw, *ck)
-    notes = str(raw.get("notes", ""))
-    return pbr.sanitize(map_name, raw, k), notes
+            continue
+        notes = str(raw.get("notes", ""))
+        cache_put("gemini_map", {"params": raw, "notes": notes}, m, *base)
+        results[m] = (pbr.sanitize(m, raw, k), notes)
+        found += 1
+    if not found:
+        raise AIError("Gemini answered, but none of the requested maps were in the answer. Try again.",
+                      "gemini", "response")
+    return results
+
+
+def params_with_gemini(map_name: str, description: str, pal: dict, hint: str = "",
+                       rgb=None, model: str | None = None) -> tuple[dict, str]:
+    """Single-map convenience wrapper around params_for_maps."""
+    res = params_for_maps([map_name], description, pal, hint, rgb, model)
+    if map_name not in res:
+        raise AIError(f"Gemini did not return settings for '{map_name}'. Try again.", "gemini", "response")
+    return res[map_name]

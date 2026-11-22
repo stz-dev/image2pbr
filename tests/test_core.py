@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import pytest
 
-from image2pbr import export, pbr, preview, samples
+from image2pbr import export, pbr, samples, viewer
 
 
 @pytest.fixture(scope="module")
@@ -96,15 +96,6 @@ def test_chunked_region_matches_full(wood, palette):
     assert np.allclose(full, chunked, atol=1e-5)
 
 
-def test_preview_shapes(wood, palette):
-    maps = {m: pbr.render(wood, m, pbr.defaults(m), palette, max_side=256)
-            for m in ("roughness", "metallic", "normal", "ao")}
-    for shape in ("Sphere", "Plane"):
-        img = preview.render_preview(wood, maps, shape, 2, 40, 45, size=128)
-        assert img.shape == (128, 128, 3) and img.dtype == np.uint8
-    assert preview.render_preview(wood, {}, "Sphere", size=64).shape == (64, 64, 3)
-
-
 def test_bundle_contents_and_blender_script(wood, palette):
     params = {m: pbr.defaults(m) for m in pbr.MAPS}
     buf = io.BytesIO()
@@ -126,15 +117,36 @@ def test_save_png_roundtrip(tmp_path, wood):
     assert np.array_equal(back, wood)
 
 
-def test_preview_layer_selection(wood, palette):
-    maps = {m: pbr.render(wood, m, pbr.defaults(m), palette, max_side=256) for m in pbr.MAPS}
-    full = preview.render_preview(wood, maps, "Sphere", size=96).astype(float)
-    base_only = preview.render_preview(wood, maps, "Sphere", size=96, use=["basecolor"]).astype(float)
-    no_base = preview.render_preview(wood, maps, "Sphere", size=96, use=["normal"]).astype(float)
-    with_height = preview.render_preview(wood, maps, "Sphere", size=96, use=["basecolor", "height"],
-                                         height_strength=5).astype(float)
-    assert np.abs(full - base_only).mean() > 1          # extra maps change the shading
-    assert np.abs(base_only - no_base).mean() > 1       # base colour toggle matters
-    assert np.abs(base_only - with_height).mean() > 0.5  # height acts as bump
-    # a layer that is selected but missing is ignored instead of crashing
-    preview.render_preview(wood, {}, "Plane", size=64, use=["roughness", "height", "ao"])
+def test_user_presets_roundtrip(tmp_path, monkeypatch, wood, palette):
+    from image2pbr import presets
+    monkeypatch.setenv("IMAGE2PBR_PRESETS", str(tmp_path / "p.json"))
+    assert presets.names() == list(pbr.PRESETS)
+    params = {m: pbr.defaults(m) for m in pbr.MAPS}
+    params["roughness"]["out_min"] = 0.33
+    params["roughness"]["palette_values"] = [0.1, 0.2]
+    label = presets.save_user("  Brushed   steel ", params)
+    assert label == "My: Brushed steel" and label in presets.names()
+    got = presets.get_params(label, "roughness", 5)
+    assert abs(got["out_min"] - 0.33) < 1e-9
+    assert got["palette_values"] == []                      # lists are dropped unless requested
+    presets.save_user("Keep lists", params, include_lists=True)
+    assert presets.get_params("My: Keep lists", "roughness", 4)["palette_values"] == [0.1, 0.2, 0.6, 0.6]
+    for m in pbr.MAPS:
+        pbr.render(wood, m, presets.get_params(label, m, 5), palette, max_side=64)
+    assert presets.get_params("Wood", "normal", 5)["strength"] == 2.5     # built-ins still work
+    with pytest.raises(ValueError):
+        presets.save_user("Wood", params)                    # cannot shadow a built-in
+    with pytest.raises(ValueError):
+        presets.save_user("   ", params)
+    assert presets.delete_user(label) and label not in presets.names()
+    assert not presets.delete_user(label)
+
+
+def test_viewer_document(wood, palette):
+    maps = {m: pbr.render(wood, m, pbr.defaults(m), palette, max_side=64) for m in ("roughness", "normal", "height")}
+    doc = viewer.build_document(wood, maps, 64)
+    assert doc.startswith("<!doctype html>") and "__CONFIG__" not in doc
+    assert doc.count("data:image/png;base64,") == 3 and "data:image/jpeg;base64," in doc
+    assert "kNormal" in doc and "kBump" in doc and "kDisp" in doc
+    assert 'srcdoc="' in viewer.iframe(doc, 300)
+    assert "metallic" not in viewer.build_document(wood, {}, 32).split('"maps":')[1].split("}")[0]

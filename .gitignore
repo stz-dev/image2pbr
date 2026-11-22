@@ -21,3 +21,6 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# personal presets
+user_presets.json

@@ -10,7 +10,7 @@ import numpy as np
 
 from . import pbr
 
-BLENDER_TEMPLATE = '''"""Image2PBR - creates a Blender material from the maps in this folder.
+BLENDER_TEMPLATE = r'''"""Image2PBR - creates a Blender material from the maps in this folder.
 
 How to use: open Blender -> Scripting tab -> Open this file -> Run Script (Alt+P).
 If a mesh object is active, the material is assigned to it.
@@ -21,28 +21,56 @@ import os
 MATERIAL_NAME = "Image2PBR"
 TILING = 1.0            # texture repeat (use a seamless base colour for tiling > 1)
 DISPLACEMENT = 0.05     # height scale in metres (only if a height map exists)
-TEXTURE_DIR = ""        # leave empty = the folder of this script
+TEXTURE_DIR = ""        # folder with the maps. Empty = search automatically (see below)
 
 FILES = __FILES__       # role -> file name
 
 
-def _dir():
+def _candidate_dirs():
+    """Folders where the maps may be: TEXTURE_DIR, next to this script, next to the .blend, cwd."""
+    dirs = []
     if TEXTURE_DIR:
-        return bpy.path.abspath(TEXTURE_DIR)
+        dirs.append(bpy.path.abspath(TEXTURE_DIR))
     try:
-        return os.path.dirname(os.path.abspath(__file__))
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
     except NameError:
         pass
     try:
         text = bpy.context.space_data.text
-        if text and text.filepath:
-            return os.path.dirname(bpy.path.abspath(text.filepath))
+        if text is not None and text.filepath:
+            dirs.append(os.path.dirname(bpy.path.abspath(text.filepath)))
     except AttributeError:
         pass
-    raise RuntimeError("Set TEXTURE_DIR at the top of the script to the folder with the maps.")
+    for t in bpy.data.texts:                       # any script opened in Blender's text editor
+        if t.filepath and os.path.basename(bpy.path.abspath(t.filepath)) == "blender_setup.py":
+            dirs.append(os.path.dirname(bpy.path.abspath(t.filepath)))
+    if bpy.data.filepath:
+        dirs.append(os.path.dirname(bpy.data.filepath))
+    dirs.append(os.getcwd())
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
 
 
-DIR = _dir()
+def _find_dir():
+    tried = _candidate_dirs()
+    for d in tried:
+        if any(os.path.isfile(os.path.join(d, f)) for f in FILES.values()):
+            return d
+    raise RuntimeError(
+        "Image2PBR: the texture files were not found.\n"
+        "Expected files: %s\n"
+        "Searched folders:\n  %s\n"
+        "Fix: extract the whole ZIP first and keep blender_setup.py in the same folder as the PNG maps, "
+        "or set TEXTURE_DIR at the top of this script, e.g. TEXTURE_DIR = r\"D:\\Textures\\wood\"."
+        % (", ".join(FILES.values()), "\n  ".join(tried)))
+
+
+DIR = _find_dir()
+print("Image2PBR: using textures from", DIR)
 mat = bpy.data.materials.get(MATERIAL_NAME) or bpy.data.materials.new(MATERIAL_NAME)
 mat.use_nodes = True
 nodes, links = mat.node_tree.nodes, mat.node_tree.links
@@ -64,8 +92,17 @@ links.new(coord.outputs["UV"], mapping.inputs["Vector"])
 _row = [0]
 
 
+class _Missing:
+    """Placeholder returned when a map file is missing: linking to it is silently skipped."""
+    outputs = {"Color": None}
+
+
 def tex(role, colorspace):
-    img = bpy.data.images.load(os.path.join(DIR, FILES[role]), check_existing=True)
+    path = os.path.join(DIR, FILES[role])
+    if not os.path.isfile(path):
+        print("Image2PBR: WARNING - file not found, skipped:", path)
+        return _Missing()
+    img = bpy.data.images.load(path, check_existing=True)
     img.colorspace_settings.name = colorspace
     node = nodes.new("ShaderNodeTexImage")
     node.image = img
@@ -76,42 +113,53 @@ def tex(role, colorspace):
     return node
 
 
+def connect(node, socket):
+    """Link a texture node's colour to a socket unless the texture was missing."""
+    if not isinstance(node, _Missing):
+        links.new(node.outputs["Color"], socket)
+
+
 if "basecolor" in FILES:
     base = tex("basecolor", "sRGB")
-    if "ao" in FILES:
+    ao_node = tex("ao", "Non-Color") if "ao" in FILES else _Missing()
+    if not isinstance(ao_node, _Missing) and not isinstance(base, _Missing):
         mix = nodes.new("ShaderNodeMixRGB")
         mix.blend_type = "MULTIPLY"
         mix.inputs["Fac"].default_value = 1.0
         mix.location = (300, 300)
-        links.new(base.outputs["Color"], mix.inputs["Color1"])
-        links.new(tex("ao", "Non-Color").outputs["Color"], mix.inputs["Color2"])
+        connect(base, mix.inputs["Color1"])
+        connect(ao_node, mix.inputs["Color2"])
         links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
     else:
-        links.new(base.outputs["Color"], bsdf.inputs["Base Color"])
+        connect(base, bsdf.inputs["Base Color"])
 
 if "roughness" in FILES:
-    links.new(tex("roughness", "Non-Color").outputs["Color"], bsdf.inputs["Roughness"])
+    connect(tex("roughness", "Non-Color"), bsdf.inputs["Roughness"])
 if "metallic" in FILES:
-    links.new(tex("metallic", "Non-Color").outputs["Color"], bsdf.inputs["Metallic"])
+    connect(tex("metallic", "Non-Color"), bsdf.inputs["Metallic"])
 if "normal" in FILES:
-    nmap = nodes.new("ShaderNodeNormalMap")
-    nmap.location = (300, -300)
-    links.new(tex("normal", "Non-Color").outputs["Color"], nmap.inputs["Color"])
-    links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+    normal_tex = tex("normal", "Non-Color")
+    if not isinstance(normal_tex, _Missing):
+        nmap = nodes.new("ShaderNodeNormalMap")
+        nmap.location = (300, -300)
+        connect(normal_tex, nmap.inputs["Color"])
+        links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
 if "height" in FILES:
-    disp = nodes.new("ShaderNodeDisplacement")
-    disp.location = (600, -400)
-    disp.inputs["Scale"].default_value = DISPLACEMENT
-    disp.inputs["Midlevel"].default_value = 0.5
-    links.new(tex("height", "Non-Color").outputs["Color"], disp.inputs["Height"])
-    links.new(disp.outputs["Displacement"], out.inputs["Displacement"])
-    try:
-        mat.displacement_method = "BOTH"            # Blender 4.2+
-    except Exception:
+    height_tex = tex("height", "Non-Color")
+    if not isinstance(height_tex, _Missing):
+        disp = nodes.new("ShaderNodeDisplacement")
+        disp.location = (600, -400)
+        disp.inputs["Scale"].default_value = DISPLACEMENT
+        disp.inputs["Midlevel"].default_value = 0.5
+        connect(height_tex, disp.inputs["Height"])
+        links.new(disp.outputs["Displacement"], out.inputs["Displacement"])
         try:
-            mat.cycles.displacement_method = "BOTH"  # older versions
+            mat.displacement_method = "BOTH"            # Blender 4.2+
         except Exception:
-            pass
+            try:
+                mat.cycles.displacement_method = "BOTH"  # older versions
+            except Exception:
+                pass
 
 obj = bpy.context.active_object
 if obj is not None and obj.type == "MESH":

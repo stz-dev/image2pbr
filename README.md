@@ -8,6 +8,10 @@ script that builds the material for you.
 > belong to your texture. Image2PBR works differently: the AI only **chooses settings**, and every map is
 > **computed from the pixels of your own image**, so the result always lines up with the picture.
 
+<p align="center">
+  <img src="docs/main.png" alt="Image2PBR main window: source texture, generated map and parameters" width="900">
+</p>
+
 ## Features
 
 - **Qwen + Gemini pipeline** - Qwen (vision, via Groq) describes the material and what each colour is
@@ -21,12 +25,19 @@ script that builds the material for you.
 - **Blender script** - builds a Principled BSDF material with all nodes wired (Non-Color maps, Normal Map
   node, Displacement, AO multiplied into base colour).
 - **Seamless option** - make any texture tileable (variance-preserving cross-fade).
-- **3D preview** - lit sphere / plane shaded with your generated maps right in the app (no Blender needed). Tick which layers to apply (base colour, roughness, metallic, normal, height as bump, AO), move the light, change tiling. It updates after *Generate ALL* and when you open the tab.
+- **Real-time 3D viewer** - WebGL in your browser (no Blender needed): drag to rotate, wheel to zoom, sphere / plane / cube. Every map has its own **strength slider** (base colour, roughness, metallic, normal, AO, height as bump and as real displacement), plus light direction/height/intensity, environment light and tiling. Settings are remembered, *Save PNG* takes a screenshot, and a standalone `viewer.html` is offered for download.
+- **One Gemini request for all maps** (cached per map, so re-runs cost nothing) and **your own named presets** (*My: name*, stored in `user_presets.json`).
 - **Batch mode** - process a whole set of images into one ZIP.
 - **Undo** per map, **presets** that work without AI, **dark theme**.
 - **AI response cache** - identical requests don't burn your free-tier limits.
 - **Model pickers** for Qwen/Gemini (lists are fetched from the APIs) and built-in key setup with
   error messages when a service isn't working.
+
+### Example result
+
+<p align="center">
+  <img src="docs/maps.png" alt="Source texture and generated roughness, metallic, normal, height and AO maps" width="900">
+</p>
 
 ## Quick start
 
@@ -63,6 +74,10 @@ You can also copy `.env.example` to `.env` and edit it yourself.
 
 **No keys?** The app still works: use the presets and sliders.
 
+<p align="center">
+  <img src="docs/settings.png" alt="Settings tab: API keys, links, model pickers" width="700">
+</p>
+
 ## How to use
 
 1. Upload a texture. Pick the map you want to tune.
@@ -79,6 +94,12 @@ Tips:
 - *Also send the image to Gemini* improves accuracy but sends your image to Google as well
   (on the free tier Google may use it to improve its products).
 
+### 3D preview
+
+<p align="center">
+  <img src="docs/preview.png" alt="Interactive 3D viewer with strength sliders for every map" width="900">
+</p>
+
 ### In Blender
 
 1. Extract the ZIP, open Blender → **Scripting** tab → **Open** `blender_setup.py` → **Run Script**.
@@ -86,6 +107,10 @@ Tips:
 
 Manual setup: load every map with **Color Space = Non-Color** (except the base colour), connect the normal
 map through a **Normal Map** node (format: OpenGL, which is Blender's default).
+
+<p align="center">
+  <img src="docs/blender.png" alt="Material created in Blender by blender_setup.py" width="800">
+</p>
 
 ## How it works
 
@@ -120,7 +145,8 @@ image2pbr/
   pbr.py                map generation (palette, tone, roughness/metallic/normal/height/AO, seamless)
   ai.py                 Groq/Qwen + Gemini clients, key checks, cache, error classification
   ui.py                 Gradio interface
-  preview.py            software 3D preview
+  viewer.py             interactive WebGL 3D viewer
+  presets.py            built-in + user presets
   export.py             PNG/ZIP export and the Blender script
   settings.py           .env handling, model names
   samples.py            procedural test textures
@@ -157,3 +183,11 @@ service. Nothing else is uploaded.
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+
+## Troubleshooting: Blender script
+
+`Cannot read '...source.png'` means the script could not find the maps. Extract the **whole ZIP** (do not
+run the script from inside the archive), keep `blender_setup.py` next to the PNG files, or set
+`TEXTURE_DIR` at the top of the script to that folder. The script now searches several folders and
+lists them in the error message; missing maps are skipped with a warning.
